@@ -151,6 +151,15 @@ def agente_redator(candidato: dict, feedback_anterior: str | None = None) -> dic
     system = f"""You are the SEO writer for "{SITE_CONFIG['nome']}", a tech launch
 news site. Tone: {SITE_CONFIG['tom_de_voz']}
 
+The news item given to you was already published by a reputable, established
+tech outlet (TechCrunch, The Verge, Engadget). Treat it as a confirmed, real
+event — do not question whether the product or update actually exists, and
+do not write about your own uncertainty. Your job is only to write the
+launch-day article based on the given title/summary, the same way any tech
+blog re-covers a story that broke elsewhere. If the summary is thin, write a
+shorter but still normal review-style article — never a meta-commentary
+piece about withholding publication.
+
 Given a news item, write a launch-day article. Respond STRICTLY as JSON:
 {{
   "titulo_seo": "clickable but accurate title, under 65 chars",
@@ -170,6 +179,19 @@ No text outside the JSON. No markdown code fences."""
 
     resposta = rodar_agente(system, user_msg)
     return _parse_json_seguro(resposta)
+
+
+MARCADORES_DE_RECUSA = [
+    "not publishing", "unverifiable", "we're not publishing",
+    "did not run it", "we didn't run it", "cannot verify", "won't be publishing",
+]
+
+
+def _parece_recusa(artigo: dict) -> bool:
+    """Detecta se o Redator escreveu um artigo 'meta' (recusando a pauta)
+    em vez de um review normal. Isso não deve ser publicado como post."""
+    texto = (artigo.get("titulo_seo", "") + " " + artigo.get("corpo_html", "")).lower()
+    return any(marcador in texto for marcador in MARCADORES_DE_RECUSA)
 
 
 def _parse_json_seguro(texto: str) -> dict:
@@ -324,6 +346,13 @@ def orquestrador():
             if "erro" in artigo:
                 print(f"[Redator] Erro de geração: {artigo['erro']}")
                 break
+
+            if _parece_recusa(artigo):
+                feedback = ("Your previous draft was a meta-article about not "
+                            "publishing the story. Write an actual review article "
+                            "instead, treating the source as confirmed.")
+                print("[Redator] Gerou artigo de recusa em vez de review. Tentando de novo...")
+                continue
 
             print("[Editor] Revisando...")
             resultado = agente_editor(artigo)
