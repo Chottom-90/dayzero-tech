@@ -1,38 +1,54 @@
 :root {
-  --bg: #0b0d12;
-  --surface: #12151c;
-  --text: #e6e8eb;
-  --text-muted: #9aa1ac;
-  --accent: #5b8cff;
-  --border: #232732;
-  --max-width: 720px;
+  --bg: #ffffff;
+  --text: #1d1d1f;
+  --text-muted: #6e6e73;
+  --accent: #0071e3;
+  --border: #e5e5e7;
+  --max-width: 680px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000;
+    --text: #f5f5f7;
+    --text-muted: #a1a1a6;
+    --border: #2a2a2c;
+  }
 }
 
 * { box-sizing: border-box; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
 
 body {
   margin: 0;
   padding: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  line-height: 1.65;
+  font-family: "Poppins", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-weight: 300;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
 }
 
 .wrap {
   max-width: var(--max-width);
   margin: 0 auto;
-  padding: 48px 20px 80px;
+  padding: 88px 24px 100px;
 }
 
 /* ---------- Header ---------- */
 header.site-header {
-  margin-bottom: 40px;
+  margin-bottom: 64px;
+  animation: fadeUp 0.5s ease both;
 }
 
 header.site-header a.logo {
-  font-size: 1.6rem;
-  font-weight: 800;
+  font-size: 2.1rem;
+  font-weight: 500;
   color: var(--text);
   text-decoration: none;
   letter-spacing: -0.02em;
@@ -44,8 +60,10 @@ header.site-header a.logo span {
 
 header.site-header p.tagline {
   color: var(--text-muted);
-  margin: 6px 0 0;
-  font-size: 0.95rem;
+  margin: 10px 0 0;
+  font-size: 1.05rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
 }
 
 /* ---------- Post list (index) ---------- */
@@ -53,32 +71,110 @@ ul.post-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
 }
 
 ul.post-list li {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-  transition: border-color 0.15s ease, transform 0.15s ease;
+  border-bottom: 1px solid var(--border);
+  animation: fadeUp 0.5s ease both;
 }
 
-ul.post-list li:hover {
-  border-color: var(--accent);
-  transform: translateY(-1px);
-}
+ul.post-list li:nth-child(1) { animation-delay: 0.05s; }
+ul.post-list li:nth-child(2) { animation-delay: 0.10s; }
+ul.post-list li:nth-child(3) { animation-delay: 0.15s; }
+ul.post-list li:nth-child(4) { animation-delay: 0.20s; }
+ul.post-list li:nth-child(5) { animation-delay: 0.25s; }
+ul.post-list li:nth-child(n+6) { animation-delay: 0.3s; }
 
 ul.post-list li a {
   display: block;
-  padding: 18px 20px;
+  padding: 26px 0;
   color: var(--text);
   text-decoration: none;
-  font-weight: 600;
-  font-size: 1.05rem;
+  font-weight: 500;
+  font-size: 1.3rem;
+  letter-spacing: -0.015em;
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+
+ul.post-list li a:hover {
+  color: var(--accent);
+  transform: translateX(4px);
 }
 
 /* ---------- Article page ---------- */
+article {
+  animation: fadeUp 0.5s ease both;
+}
+
 article h1 {
-  font-size: 1.9rem;
+  font-size: 2.4rem;
+  line-height: 1.15;
+  font-weight: 500;
+  margin: 0 0 12px;
+  letter-spacing: -0.03em;
+}
+
+article > p em {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  font-style: normal;
+}
+
+article h2 {
+  font-size: 1.35rem;
+  font-weight: 500;
+  margin: 40px 0 12px;
+  letter-spacing: -0.015em;
+}
+
+article p {
+  margin: 0 0 18px;
+  color: var(--text);
+  font-size: 1.08rem;
+}
+
+article ul, article ol {
+  margin: 0 0 18px;
+  padding-left: 22px;
+}
+
+article li {
+  margin-bottom: 8px;
+  font-size: 1.05rem;
+}
+
+article a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+article small {
+  color: var(--text-muted);
+  display: block;
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+/* ---------- Back link ---------- */
+.back-link {
+  display: inline-block;
+  margin-top: 40px;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+  transition: opacity 0.2s ease;
+}
+
+.back-link:hover {
+  opacity: 0.7;
+}
+
+/* ---------- Empty state ---------- */
+.empty-state {
+  color: var(--text-muted);
+  font-size: 1.1rem;
+}
