@@ -1,5 +1,5 @@
 
-name: Daily Content Pipeline
+name: Vantage Intelligence Radar
 
 on:
   workflow_dispatch: {}
@@ -9,10 +9,10 @@ permissions:
 
 jobs:
   run-pipeline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout do repositório
+      - name: Checkout do repositorio
         uses: actions/checkout@v4
 
       - name: Configurar Python
@@ -20,11 +20,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar dependências
+      - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Rodar pipeline em modo de teste
+      - name: Executar Vantage Radar
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MODO_AUTOMATICO: "false"
         run: python caca_lancamentos_tech.py
+
+      - name: Disponibilizar relatorios para download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vantage-radar-reports
+          path: |
+            reports/radar.json
+            reports/radar.md
+          if-no-files-found: error
+          retention-days: 30
