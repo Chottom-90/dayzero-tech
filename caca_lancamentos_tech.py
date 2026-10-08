@@ -1,404 +1,191 @@
-"""
-CAÇA-LANÇAMENTOS TECH — Pipeline autônomo de conteúdo para site de nicho
-==========================================================================
+"""Vantage — radar editorial RSS (v1.0).
 
-Modo automático (rodando via GitHub Actions, sem ninguém olhando):
-    O Agente Editor/QA é o único portão de qualidade. Se aprovar
-    internamente, publica sozinho. Ativado com a variável de ambiente
-    MODO_AUTOMATICO=true (o workflow do GitHub Actions já seta isso).
-
-Modo manual (rodando no seu computador):
-    Sem essa variável de ambiente, o script volta a te perguntar no
-    terminal antes de publicar cada artigo — útil pra testar/ajustar
-    o tom antes de soltar 100% sozinho.
-
-Fluxo:
-
-    Orquestrador (roda 1x/dia via GitHub Actions)
-        |
-        v
-    1) Agente Scanner       -> lê feeds RSS de tech, acha lançamentos das últimas 48h
-        |
-        v
-    2) Agente Redator SEO   -> escreve o artigo em inglês (título, meta, corpo, tags)
-        |
-        v
-    3) Agente Editor/QA     -> revisa qualidade (loop de correção)
-        |
-        v
-    4) Aprovação            -> automática (modo CI) OU terminal (modo local)
-        |
-        v
-    5) Agente Publicador    -> escreve o arquivo HTML em docs/ e atualiza o índice
-                                (GitHub Actions faz o commit + push sozinho depois)
+Somente leitura de fontes públicas e geração de relatórios locais.
+Não publica artigos, não modifica docs/ e não utiliza serviços de IA pagos.
 """
 
-import os
+from __future__ import annotations
+
 import json
 import re
-import time
+import unicodedata
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import feedparser
-from anthropic import Anthropic
 
-client = Anthropic()
-MODEL = "claude-sonnet-4-6"
-
-MODO_AUTOMATICO = os.environ.get("MODO_AUTOMATICO", "false").lower() == "true"
-
-# ---------------------------------------------------------------------------
-# CONFIGURAÇÃO DO SITE
-# ---------------------------------------------------------------------------
-SITE_CONFIG = {
-    "nome": "Vantage",
-    "tagline": "Tech decisions, seen from every angle.",
-    "idioma": "en",
-    "tom_de_voz": (
-        "Confident, editorial, synthesis-driven. Writes like someone who reads "
-        "every major reviewer's take and distills it into one clear verdict. "
-        "Never dry spec-listing — always frames advice around who the reader "
-        "is and what they actually need to decide. Short paragraphs, no fluff."
-    ),
-    "disclosure": "This post may include affiliate links. We may earn a "
-                  "commission at no extra cost to you.",
+FEEDS = {
+    "The Verge": "https://www.theverge.com/rss/index.xml",
+    "Engadget": "https://www.engadget.com/rss.xml",
+    "TechCrunch": "https://techcrunch.com/feed/",
 }
 
-FEEDS = [
-    "https://techcrunch.com/feed/",
-    "https://www.theverge.com/rss/index.xml",
-    "https://www.engadget.com/rss.xml",
-]
+MARCAS = {
+    "Apple": ("apple", "iphone", "ipad", "macbook", "airpods", "apple watch"),
+    "Samsung": ("samsung", "galaxy"),
+    "Motorola": ("motorola", "moto g", "moto edge", "razr"),
+    "Google": ("google pixel", "pixel phone", "pixel watch", "pixel buds"),
+    "Xiaomi": ("xiaomi", "redmi", "poco"),
+    "OnePlus": ("oneplus",),
+    "Nothing": ("nothing phone", "nothing ear", "cmf"),
+    "Honor": ("honor",),
+    "Oppo": ("oppo",),
+    "Vivo": ("vivo x", "vivo v", "iqoo"),
+    "Realme": ("realme",),
+    "Huawei": ("huawei",),
+}
 
-JANELA_HORAS = 168        # 7 dias (temporário, pra garantir achar conteúdo no teste; volte pra 48 depois)
-MAX_CANDIDATOS_POR_RUN = 3
-MAX_REVISOES = 2
+CATEGORIAS = {
+    "smartphones": ("smartphone", "phone", "iphone", "galaxy", "pixel", "android", "handset", "foldable", "razr"),
+    "wearables": ("smartwatch", "wearable", "watch", "fitness tracker", "smart ring"),
+    "audio": ("headphone", "earbud", "airpods", "audio", "speaker"),
+    "tablets": ("tablet", "ipad"),
+    "computadores": ("laptop", "notebook", "macbook", "computer", "chromebook"),
+    "acessorios": ("case", "charger", "charging", "power bank", "accessory", "accessories"),
+}
 
-SITE_DIR = Path("docs")          # GitHub Pages reconhece essa pasta nativamente
-POSTS_DIR = SITE_DIR / "posts"
-PUBLICADOS_PATH = Path("publicados.json")
-
-
-# ---------------------------------------------------------------------------
-# UTILITÁRIOS
-# ---------------------------------------------------------------------------
-def carregar_publicados() -> set:
-    if PUBLICADOS_PATH.exists():
-        return set(json.loads(PUBLICADOS_PATH.read_text()))
-    return set()
-
-
-def salvar_publicado(link: str):
-    publicados = carregar_publicados()
-    publicados.add(link)
-    PUBLICADOS_PATH.write_text(json.dumps(sorted(publicados), indent=2))
-
-
-def slugify(texto: str) -> str:
-    texto = texto.lower()
-    texto = re.sub(r"[^a-z0-9]+", "-", texto).strip("-")
-    return texto[:80]
+JANELA_HORAS = 168
+MAX_ITENS_POR_FEED = 80
+MAX_OPORTUNIDADES = 30
+PASTA_RELATORIOS = Path("reports")
 
 
-def rodar_agente(system_prompt: str, user_message: str, max_tokens: int = 1200) -> str:
-    resposta = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    return "".join(b.text for b in resposta.content if b.type == "text")
+def normalizar(texto: str) -> str:
+    texto = unicodedata.normalize("NFKD", texto.casefold())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto)
 
 
-# ---------------------------------------------------------------------------
-# 1) AGENTE SCANNER
-# ---------------------------------------------------------------------------
-def agente_scanner() -> list[dict]:
-    publicados = carregar_publicados()
-    limite = datetime.now(timezone.utc) - timedelta(hours=JANELA_HORAS)
-    candidatos = []
-
-    for url_feed in FEEDS:
-        feed = feedparser.parse(url_feed)
-        for entrada in feed.entries:
-            link = entrada.get("link")
-            if not link or link in publicados:
-                continue
-
-            publicado_em = entrada.get("published_parsed") or entrada.get("updated_parsed")
-            if not publicado_em:
-                continue
-            data_pub = datetime(*publicado_em[:6], tzinfo=timezone.utc)
-            if data_pub < limite:
-                continue
-
-            candidatos.append({
-                "titulo": entrada.get("title", ""),
-                "link": link,
-                "resumo": entrada.get("summary", "")[:500],
-                "fonte": feed.feed.get("title", url_feed),
-                "publicado_em": data_pub.isoformat(),
-            })
-
-    candidatos.sort(key=lambda c: c["publicado_em"], reverse=True)
-    return candidatos[:MAX_CANDIDATOS_POR_RUN]
+def contem_termo(texto: str, termo: str) -> bool:
+    return bool(re.search(r"(?<!\w)" + re.escape(normalizar(termo)) + r"(?!\w)", texto))
 
 
-# ---------------------------------------------------------------------------
-# 2) AGENTE REDATOR SEO
-# ---------------------------------------------------------------------------
-def agente_redator(candidato: dict, feedback_anterior: str | None = None) -> dict:
-    system = f"""You are the SEO writer for "{SITE_CONFIG['nome']}", a tech launch
-news site. Tone: {SITE_CONFIG['tom_de_voz']}
-
-The news item given to you was already published by a reputable, established
-tech outlet (TechCrunch, The Verge, Engadget). Treat it as a confirmed, real
-event — do not question whether the product or update actually exists, and
-do not write about your own uncertainty. Your job is only to write the
-launch-day article based on the given title/summary, the same way any tech
-blog re-covers a story that broke elsewhere. If the summary is thin, write a
-shorter but still normal review-style article — never a meta-commentary
-piece about withholding publication.
-
-Given a news item, write a launch-day article. Respond STRICTLY as JSON:
-{{
-  "titulo_seo": "clickable but accurate title, under 65 chars",
-  "meta_descricao": "under 155 chars, includes the product name",
-  "corpo_html": "the article body as HTML (use <p>, <h2>, <ul> where useful), 350-500 words",
-  "tags": ["tag1", "tag2", "tag3"]
-}}
-No text outside the JSON. No markdown code fences."""
-
-    user_msg = (
-        f"SOURCE TITLE: {candidato['titulo']}\n"
-        f"SOURCE SUMMARY: {candidato['resumo']}\n"
-        f"SOURCE LINK (cite as origin, do not copy text verbatim): {candidato['link']}"
-    )
-    if feedback_anterior:
-        user_msg += f"\n\nPREVIOUS DRAFT WAS REJECTED. Fix this:\n{feedback_anterior}"
-
-    resposta = rodar_agente(system, user_msg)
-    return _parse_json_seguro(resposta)
+def limpar_html(texto: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", texto or "")).strip()
 
 
-MARCADORES_DE_RECUSA = [
-    "not publishing", "unverifiable", "we're not publishing",
-    "did not run it", "we didn't run it", "cannot verify", "won't be publishing",
-]
+def canonicalizar_url(url: str) -> str:
+    partes = urlsplit(url.strip())
+    parametros = [(k, v) for k, v in parse_qsl(partes.query) if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid"}]
+    return urlunsplit((partes.scheme.lower(), partes.netloc.lower(), partes.path.rstrip("/"), urlencode(parametros), ""))
 
 
-def _parece_recusa(artigo: dict) -> bool:
-    """Detecta se o Redator escreveu um artigo 'meta' (recusando a pauta)
-    em vez de um review normal. Isso não deve ser publicado como post."""
-    texto = (artigo.get("titulo_seo", "") + " " + artigo.get("corpo_html", "")).lower()
-    return any(marcador in texto for marcador in MARCADORES_DE_RECUSA)
+def classificar(titulo: str, resumo: str) -> tuple[list[str], list[str]]:
+    texto = normalizar(f"{titulo} {resumo}")
+    marcas = [marca for marca, termos in MARCAS.items() if any(contem_termo(texto, termo) for termo in termos)]
+    categorias = [cat for cat, termos in CATEGORIAS.items() if any(contem_termo(texto, termo) for termo in termos)]
+    return marcas, categorias
 
 
-def _parse_json_seguro(texto: str) -> dict:
-    limpo = texto.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+def obter_data(entrada) -> datetime | None:
+    data = entrada.get("published_parsed") or entrada.get("updated_parsed")
+    if not data:
+        return None
     try:
-        return json.loads(limpo)
-    except json.JSONDecodeError:
-        return {"erro": f"JSON inválido: {texto[:300]}"}
+        return datetime(*data[:6], tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
-# ---------------------------------------------------------------------------
-# 3) AGENTE EDITOR / QA — único portão de qualidade em modo automático
-# ---------------------------------------------------------------------------
-def agente_editor(artigo: dict) -> dict:
-    system = """You are the Quality/Compliance editor for a tech news site.
-You are the FINAL gate before publication — no human reviews this after you.
-Reject if: the title is misleading/clickbait beyond the facts, the body reads
-like a copy-paste of a press release, factual claims sound fabricated or
-unverifiable, length is under 300 words, or tone doesn't match a
-professional tech blog. Be strict. Respond STRICTLY as JSON:
-{"aprovado": true or false, "motivo": "short reason, or 'ok' if approved"}"""
+def coletar() -> tuple[list[dict], list[str]]:
+    limite = datetime.now(timezone.utc) - timedelta(hours=JANELA_HORAS)
+    registros: dict[str, dict] = {}
+    avisos: list[str] = []
 
-    conteudo = json.dumps(artigo, ensure_ascii=False)
-    resposta = rodar_agente(system, conteudo, max_tokens=300)
-    resultado = _parse_json_seguro(resposta)
-    return resultado if "erro" not in resultado else {"aprovado": False, "motivo": "parse error"}
+    for nome, url in FEEDS.items():
+        try:
+            feed = feedparser.parse(url, agent="VantageEditorialRadar/1.0")
+            if getattr(feed, "bozo", False):
+                avisos.append(f"{nome}: feed sinalizou problema de leitura; resultados podem estar incompletos")
+            if not feed.entries:
+                avisos.append(f"{nome}: nenhuma entrada retornada")
+            for entrada in feed.entries[:MAX_ITENS_POR_FEED]:
+                link = entrada.get("link", "").strip()
+                titulo = limpar_html(entrada.get("title", ""))
+                data = obter_data(entrada)
+                if not link or not titulo or data is None or data < limite:
+                    continue
+                resumo = limpar_html(entrada.get("summary", ""))[:500]
+                marcas, categorias = classificar(titulo, resumo)
+                if not marcas and not categorias:
+                    continue
+                chave = canonicalizar_url(link)
+                registros.setdefault(chave, {
+                    "titulo": titulo,
+                    "url": link,
+                    "fonte": nome,
+                    "publicado_em": data.isoformat(),
+                    "resumo": resumo,
+                    "marcas": marcas,
+                    "categorias": categorias,
+                })
+        except Exception as exc:
+            avisos.append(f"{nome}: erro na coleta ({type(exc).__name__}: {exc})")
 
-
-# ---------------------------------------------------------------------------
-# 4) APROVAÇÃO — automática (CI) ou terminal (local)
-# ---------------------------------------------------------------------------
-def decidir_publicacao(artigo: dict, candidato: dict, aprovado_pelo_editor: bool) -> bool:
-    if MODO_AUTOMATICO:
-        # Sem terminal disponível (rodando no GitHub Actions) — o Editor já decidiu.
-        return aprovado_pelo_editor
-
-    print("\n" + "=" * 70)
-    print(f"CANDIDATO A PUBLICAÇÃO — fonte: {candidato['fonte']}")
-    print("=" * 70)
-    print(f"Título SEO: {artigo.get('titulo_seo')}")
-    print(f"Meta descrição: {artigo.get('meta_descricao')}")
-    print(f"Tags: {artigo.get('tags')}")
-    print("-" * 70)
-    print(artigo.get("corpo_html", "")[:1500])
-    print("-" * 70)
-    resposta = input("Aprovar e publicar este artigo? [s/n]: ").strip().lower()
-    return resposta == "s"
-
-
-# ---------------------------------------------------------------------------
-# 5) AGENTE PUBLICADOR
-# ---------------------------------------------------------------------------
-TEMPLATE_POST = """<!DOCTYPE html>
-<html lang="{idioma}">
-<head>
-<meta charset="UTF-8">
-<title>{titulo}</title>
-<meta name="description" content="{meta}">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="../style.css">
-</head>
-<body>
-<div class="wrap">
-<header class="site-header">
-<a class="logo" href="../index.html">Vantage</a>
-</header>
-<article>
-<h1>{titulo}</h1>
-<p><em>{disclosure}</em></p>
-{corpo}
-<small>Source: <a href="{fonte_link}">{fonte_nome}</a></small>
-</article>
-<a class="back-link" href="../index.html">&larr; Back to {site_nome}</a>
-</div>
-</body>
-</html>"""
-
-TEMPLATE_INDEX = """<!DOCTYPE html>
-<html lang="{idioma}">
-<head>
-<meta charset="UTF-8">
-<title>{site_nome}</title>
-<meta name="description" content="{tagline}">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
-</head>
-<body>
-<div class="wrap">
-<header class="site-header">
-<a class="logo" href="index.html">Vantage</a>
-<p class="tagline">{tagline}</p>
-</header>
-<ul class="post-list">
-{lista_posts}
-</ul>
-</div>
-</body>
-</html>"""
+    return sorted(registros.values(), key=lambda item: item["publicado_em"], reverse=True), avisos
 
 
-def agente_publicador(artigo: dict, candidato: dict) -> Path:
-    POSTS_DIR.mkdir(parents=True, exist_ok=True)
-    slug = slugify(artigo["titulo_seo"])
-    caminho_post = POSTS_DIR / f"{slug}.html"
+def agrupar(registros: list[dict]) -> list[dict]:
+    grupos: dict[str, list[dict]] = defaultdict(list)
+    for item in registros:
+        # Agrupamento exploratório por marca e categoria; não afirma que os links
+        # tratam do mesmo lançamento ou modelo específico.
+        marca = item["marcas"][0] if item["marcas"] else "Sem marca definida"
+        categoria = item["categorias"][0] if item["categorias"] else "geral"
+        grupos[f"{marca} | {categoria}"].append(item)
 
-    html_post = TEMPLATE_POST.format(
-        idioma=SITE_CONFIG["idioma"],
-        titulo=artigo["titulo_seo"],
-        meta=artigo["meta_descricao"],
-        disclosure=SITE_CONFIG["disclosure"],
-        corpo=artigo["corpo_html"],
-        fonte_link=candidato["link"],
-        fonte_nome=candidato["fonte"],
-        site_nome=SITE_CONFIG["nome"],
-    )
-    caminho_post.write_text(html_post, encoding="utf-8")
-
-    _reconstruir_index()
-    salvar_publicado(candidato["link"])
-    return caminho_post
-
-
-def _reconstruir_index():
-    itens = []
-    for arquivo in sorted(POSTS_DIR.glob("*.html"), reverse=True):
-        titulo = arquivo.stem.replace("-", " ").title()
-        itens.append(f'<li><a href="posts/{arquivo.name}">{titulo}</a></li>')
-
-    html_index = TEMPLATE_INDEX.format(
-        idioma=SITE_CONFIG["idioma"],
-        site_nome=SITE_CONFIG["nome"],
-        tagline=SITE_CONFIG["tagline"],
-        lista_posts="\n".join(itens) if itens else '<p class="empty-state">No posts yet.</p>',
-    )
-    SITE_DIR.mkdir(parents=True, exist_ok=True)
-    (SITE_DIR / "index.html").write_text(html_index, encoding="utf-8")
+    oportunidades = []
+    for assunto, itens in grupos.items():
+        fontes = sorted({item["fonte"] for item in itens})
+        score = min(100, 15 + 12 * len(fontes) + 4 * min(len(itens), 8))
+        oportunidades.append({
+            "assunto_exploratorio": assunto,
+            "pontuacao_triagem": score,
+            "quantidade_publicacoes": len(itens),
+            "quantidade_fontes": len(fontes),
+            "fontes": fontes,
+            "links": [{"titulo": i["titulo"], "url": i["url"], "fonte": i["fonte"], "publicado_em": i["publicado_em"]} for i in itens[:12]],
+            "status": "pesquisa_pendente",
+        })
+    return sorted(oportunidades, key=lambda o: (o["pontuacao_triagem"], o["quantidade_publicacoes"]), reverse=True)[:MAX_OPORTUNIDADES]
 
 
-# ---------------------------------------------------------------------------
-# ORQUESTRADOR
-# ---------------------------------------------------------------------------
-def orquestrador():
-    modo = "AUTOMÁTICO (sem revisão humana)" if MODO_AUTOMATICO else "MANUAL (aprovação por terminal)"
-    print(f"[Orquestrador] Modo: {modo}")
-    print(f"[Orquestrador] Buscando lançamentos das últimas {JANELA_HORAS}h...")
-    candidatos = agente_scanner()
+def salvar_relatorios(registros: list[dict], oportunidades: list[dict], avisos: list[str]) -> None:
+    PASTA_RELATORIOS.mkdir(parents=True, exist_ok=True)
+    relatorio = {
+        "gerado_em_utc": datetime.now(timezone.utc).isoformat(),
+        "modo": "somente_descoberta_sem_publicacao",
+        "janela_horas": JANELA_HORAS,
+        "total_registros": len(registros),
+        "total_oportunidades": len(oportunidades),
+        "avisos": avisos,
+        "oportunidades": oportunidades,
+        "registros": registros,
+    }
+    (PASTA_RELATORIOS / "radar.json").write_text(json.dumps(relatorio, ensure_ascii=False, indent=2), encoding="utf-8")
+    linhas = ["# Vantage — Radar editorial", "", f"Gerado em UTC: {relatorio['gerado_em_utc']}", f"Publicações relevantes: {len(registros)}", f"Grupos exploratórios: {len(oportunidades)}", "", "**Atenção:** grupos não são consensos nem dossiês verificados. Nenhum artigo foi produzido.", ""]
+    if avisos:
+        linhas += ["## Avisos", ""] + [f"- {aviso}" for aviso in avisos] + [""]
+    for posicao, op in enumerate(oportunidades, 1):
+        linhas += [f"## {posicao}. {op['assunto_exploratorio']}", f"Pontuação de triagem: {op['pontuacao_triagem']}/100 · Fontes: {op['quantidade_fontes']} · Publicações: {op['quantidade_publicacoes']}", ""]
+        linhas += [f"- [{link['titulo']}]({link['url']}) — {link['fonte']}" for link in op["links"]]
+        linhas.append("")
+    (PASTA_RELATORIOS / "radar.md").write_text("\n".join(linhas), encoding="utf-8")
 
-    if not candidatos:
-        print("[Orquestrador] Nenhum lançamento novo encontrado nesta janela. Encerrando.")
-        return
 
-    print(f"[Orquestrador] {len(candidatos)} candidato(s) encontrado(s).\n")
-
-    for candidato in candidatos:
-        print(f"\n>>> Processando: {candidato['titulo']}")
-
-        feedback = None
-        artigo = None
-        aprovado_pelo_editor = False
-        for tentativa in range(1, MAX_REVISOES + 2):
-            print(f"[Redator] Escrevendo (tentativa {tentativa})...")
-            artigo = agente_redator(candidato, feedback)
-            if "erro" in artigo:
-                print(f"[Redator] Erro de geração: {artigo['erro']}")
-                break
-
-            if _parece_recusa(artigo):
-                feedback = ("Your previous draft was a meta-article about not "
-                            "publishing the story. Write an actual review article "
-                            "instead, treating the source as confirmed.")
-                print("[Redator] Gerou artigo de recusa em vez de review. Tentando de novo...")
-                continue
-
-            print("[Editor] Revisando...")
-            resultado = agente_editor(artigo)
-            if resultado.get("aprovado"):
-                print("[Editor] Aprovado. ✅")
-                aprovado_pelo_editor = True
-                break
-            feedback = resultado.get("motivo")
-            print(f"[Editor] Reprovado: {feedback}")
-        else:
-            print("[Orquestrador] Limite de revisões atingido. Pulando este candidato.\n")
-            salvar_publicado(candidato["link"])
-            continue
-
-        if "erro" in artigo:
-            continue
-
-        if decidir_publicacao(artigo, candidato, aprovado_pelo_editor):
-            caminho = agente_publicador(artigo, candidato)
-            print(f"[Publicador] Publicado em: {caminho}")
-        else:
-            print("[Orquestrador] Não publicado.")
-            salvar_publicado(candidato["link"])
-
-        time.sleep(1)
-
-    print("\n[Orquestrador] Execução concluída.")
+def main() -> None:
+    print("[Vantage] Iniciando radar editorial em modo seguro (sem publicação).")
+    registros, avisos = coletar()
+    oportunidades = agrupar(registros)
+    salvar_relatorios(registros, oportunidades, avisos)
+    print(f"[Vantage] Publicações relevantes: {len(registros)}")
+    print(f"[Vantage] Grupos exploratórios: {len(oportunidades)}")
+    print(f"[Vantage] Avisos de feeds: {len(avisos)}")
+    print("[Vantage] Relatórios gerados: reports/radar.json e reports/radar.md")
+    print("[Vantage] Nenhum arquivo em docs/ foi modificado; nenhuma publicação realizada.")
 
 
 if __name__ == "__main__":
-    orquestrador()
+    main()
